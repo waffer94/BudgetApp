@@ -8,8 +8,8 @@ Two interchangeable backends:
   LocalStore   - a JSON file next to the app, for running on your laptop.
                  Do NOT rely on this in the cloud; the disk gets wiped.
 
-Both expose the same six methods, so swapping in Postgres later means
-writing one more class and nothing else.
+Both expose the same methods, so swapping in Postgres later means writing
+one more class and nothing else.
 """
 
 from __future__ import annotations
@@ -22,8 +22,8 @@ import streamlit as st
 
 import defaults
 
-CAT_COLS = ["id", "name", "owner", "flow", "type", "budget", "fixed"]
-TXN_COLS = ["id", "date", "kind", "cat_id", "who", "amount", "note"]
+CAT_COLS = ["id", "name", "owner", "flow", "type", "budget", "fixed", "payer"]
+TXN_COLS = ["id", "date", "kind", "cat_id", "who", "amount", "note", "paid_by"]
 SET_COLS = ["key", "value"]
 
 CAT_WS, TXN_WS, SET_WS = "categories", "transactions", "settings"
@@ -42,6 +42,42 @@ def _num(v, default=0.0) -> float:
         return float(str(v).replace("$", "").replace(",", "").strip())
     except (TypeError, ValueError):
         return default
+
+
+def _clean_cat(r: dict) -> dict:
+    """Normalise one category row, filling in anything an older sheet lacks."""
+    owner = str(r.get("owner") or "common")
+    payer = str(r.get("payer") or "").strip()
+    if not payer:
+        # Older rows have no payer. A personal category defaults to its owner;
+        # a shared one defaults to "each pays their own share", which keeps the
+        # numbers identical to how they were before this column existed.
+        payer = owner if owner != "common" else "common"
+    return {
+        "id": str(r.get("id") or new_id()),
+        "name": str(r.get("name", "")),
+        "owner": owner,
+        "flow": "in" if str(r.get("flow", "out")).lower() == "in" else "out",
+        "type": str(r.get("type", "")),
+        "budget": _num(r.get("budget")),
+        "fixed": _bool(r.get("fixed")),
+        "payer": payer,
+    }
+
+
+def _clean_txn(r: dict) -> dict:
+    return {
+        "id": str(r.get("id") or new_id()),
+        "date": str(r.get("date", "")),
+        "kind": str(r.get("kind", "expense")),
+        "cat_id": str(r.get("cat_id", "") or ""),
+        "who": str(r.get("who", "") or ""),
+        "amount": _num(r.get("amount")),
+        "note": str(r.get("note", "") or ""),
+        # Blank on entries recorded before this column existed. Treated as
+        # "each paid their own share", so history is left exactly as it was.
+        "paid_by": str(r.get("paid_by", "") or "common"),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -63,18 +99,35 @@ class SheetsStore:
 
     def _ws(self, title: str, cols: list[str]):
         try:
-            return self.sh.worksheet(title)
+            ws = self.sh.worksheet(title)
         except Exception:
-            ws = self.sh.add_worksheet(title=title, rows=200, cols=max(len(cols), 8))
+            ws = self.sh.add_worksheet(title=title, rows=200, cols=max(len(cols), 10))
             ws.update([cols], "A1")
             return ws
+        self._ensure_columns(ws, cols)
+        return ws
+
+    @staticmethod
+    def _ensure_columns(ws, cols: list[str]):
+        """Add any column this version of the app expects but the sheet lacks.
+
+        Existing data is untouched; new columns land on the right, empty, and
+        the readers above fill in sensible defaults for the blank cells.
+        """
+        header = ws.row_values(1)
+        if not header:
+            ws.update([cols], "A1")
+            return
+        missing = [c for c in cols if c not in header]
+        if missing:
+            ws.update([header + missing], "A1")
 
     def _ensure_tabs(self):
         cat = self._ws(CAT_WS, CAT_COLS)
         if len(cat.get_all_values()) <= 1:
             cat.update([CAT_COLS] + [
                 [r["id"], r["name"], r["owner"], r["flow"], r["type"],
-                 r["budget"], str(r["fixed"])]
+                 r["budget"], str(r["fixed"]), r["payer"]]
                 for r in defaults.CATEGORY_ROWS
             ], "A1")
 
@@ -89,16 +142,7 @@ class SheetsStore:
     # -- reads ------------------------------------------------------------
     def read_categories(self) -> list[dict]:
         rows = self._ws(CAT_WS, CAT_COLS).get_all_records()
-        return [
-            {"id": str(r.get("id") or new_id()),
-             "name": str(r.get("name", "")),
-             "owner": str(r.get("owner", "common")),
-             "flow": "in" if str(r.get("flow", "out")).lower() == "in" else "out",
-             "type": str(r.get("type", "")),
-             "budget": _num(r.get("budget")),
-             "fixed": _bool(r.get("fixed"))}
-            for r in rows if str(r.get("name", "")).strip()
-        ]
+        return [_clean_cat(r) for r in rows if str(r.get("name", "")).strip()]
 
     def read_settings(self) -> dict:
         rows = self._ws(SET_WS, SET_COLS).get_all_records()
@@ -111,23 +155,14 @@ class SheetsStore:
 
     def read_txns(self) -> list[dict]:
         rows = self._ws(TXN_WS, TXN_COLS).get_all_records()
-        return [
-            {"id": str(r.get("id") or new_id()),
-             "date": str(r.get("date", "")),
-             "kind": str(r.get("kind", "expense")),
-             "cat_id": str(r.get("cat_id", "") or ""),
-             "who": str(r.get("who", "") or ""),
-             "amount": _num(r.get("amount")),
-             "note": str(r.get("note", "") or "")}
-            for r in rows if str(r.get("date", "")).strip()
-        ]
+        return [_clean_txn(r) for r in rows if str(r.get("date", "")).strip()]
 
     # -- writes -----------------------------------------------------------
     def write_categories(self, cats: list[dict]):
         ws = self._ws(CAT_WS, CAT_COLS)
         body = [CAT_COLS] + [
             [c["id"], c["name"], c["owner"], c["flow"], c.get("type", ""),
-             c["budget"], str(bool(c.get("fixed")))]
+             c["budget"], str(bool(c.get("fixed"))), c.get("payer", "common")]
             for c in cats
         ]
         ws.clear()
@@ -173,13 +208,13 @@ class LocalStore:
             json.dump(data, f, indent=2)
 
     def read_categories(self):
-        return self._load()["categories"]
+        return [_clean_cat(r) for r in self._load()["categories"]]
 
     def read_settings(self):
         return self._load()["settings"]
 
     def read_txns(self):
-        return self._load()["transactions"]
+        return [_clean_txn(r) for r in self._load()["transactions"]]
 
     def write_categories(self, cats):
         d = self._load(); d["categories"] = cats; self._dump(d)
