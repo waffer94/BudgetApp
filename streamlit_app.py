@@ -39,6 +39,10 @@ st.markdown(f"""
   .settle {{ background: #fff; border: 1px solid {LINE}; border-left: 4px solid {SHARED};
              border-radius: 10px; padding: .85rem 1.1rem; margin-top: .9rem; }}
   .settle .amt {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 600; }}
+  .note {{ background: #fff; border: 1px solid {LINE}; border-left: 4px solid {BAD};
+           border-radius: 10px; padding: .75rem 1.1rem; margin-top: .9rem; font-size: .9rem; }}
+  .note .amt {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+                font-weight: 600; color: {BAD}; }}
   .cat {{ margin-bottom: .55rem; }}
   .cat .top {{ display: flex; justify-content: space-between; align-items: baseline;
                font-size: .88rem; gap: .75rem; }}
@@ -239,7 +243,10 @@ with tab_dash:
                 f'<div style="font-size:.95rem">{settle}</div></div>', unsafe_allow_html=True)
 
     if m["actual"] > m["income"]:
-        st.error(f"Spending is ahead of income this month by {money(m['actual'] - m['income'])}.", icon="▲")
+        st.markdown(
+            f'<div class="note">This month is running <span class="amt">'
+            f'{money(m["actual"] - m["income"])}</span> beyond income — carried on credit '
+            f'unless something else covers it.</div>', unsafe_allow_html=True)
 
     st.write("")
     head, btn = st.columns([3, 1])
